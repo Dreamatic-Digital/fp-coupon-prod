@@ -32,8 +32,8 @@ async function makeFingerprint(req: Request, salt: string): Promise<string> {
   const ua = req.headers.get('user-agent') ?? '';
   const acc = req.headers.get('accept') ?? '';
   const lang = req.headers.get('accept-language') ?? '';
-  const ip = getClientIp(req) ?? '';
-  return sha256Hex(`${salt}|${ua}|${acc}|${lang}|${ip}`);
+  const sid  = req.headers.get('x-client-session') ?? '';
+  return sha256Hex(`${salt}|${ua}|${acc}|${lang}|${sid}`);
 }
 
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
