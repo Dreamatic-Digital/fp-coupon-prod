@@ -25,7 +25,6 @@ async function sha256Hex(input: string): Promise<string> {
 }
 
 function getClientIp(req: Request): string | undefined {
-  // Cloudflare provides this header
   return req.headers.get('cf-connecting-ip') ?? undefined;
 }
 
@@ -37,6 +36,13 @@ async function makeFingerprint(req: Request, salt: string): Promise<string> {
   return sha256Hex(`${salt}|${ua}|${acc}|${lang}|${ip}`);
 }
 
+function sleep(ms: number) {
+  return new Promise(res => setTimeout(res, ms));
+}
+function jitter(min = 25, max = 75) {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+
 // ---- Domain allow-list check via KV ----
 async function isDomainAllowed(env: Env, email: string): Promise<boolean> {
   const domain = email.split('@')[1]?.toLowerCase().trim();
@@ -45,51 +51,82 @@ async function isDomainAllowed(env: Env, email: string): Promise<boolean> {
   return !!hit;
 }
 
-// ---- Atomic coupon allocation + redemption ----
+// ---- Atomic coupon allocation + redemption (no BEGIN; bounded retry + revert-on-conflict) ----
 async function redeemAtomic(env: Env, emailHash: string, fingerprint: string) {
   const now = Math.floor(Date.now() / 1000);
-  await env.DB.prepare('BEGIN IMMEDIATE').run();
-  try {
-    // Block repeat redemptions by email or fingerprint
-    const dup = await env.DB.prepare(
-      'SELECT 1 FROM redemptions WHERE email_hash = ?1 OR fingerprint = ?2 LIMIT 1'
-    ).bind(emailHash, fingerprint).first();
-    if (dup) {
-      await env.DB.exec('ROLLBACK');
-      return { status: 409 as const, error: 'Already redeemed' };
+
+  // Quick duplicate check (cheap)
+  const dup = await env.DB
+    .prepare('SELECT 1 FROM redemptions WHERE email_hash = ?1 OR fingerprint = ?2 LIMIT 1')
+    .bind(emailHash, fingerprint)
+    .first();
+  if (dup) return { status: 409 as const, error: 'Already redeemed' };
+
+  const MAX_TRIES = 3;
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    try {
+      // Claim one coupon atomically
+      const allocate = await env.DB.prepare(
+        `WITH pick AS (
+           SELECT code FROM coupons
+           WHERE redeemed_at IS NULL
+           LIMIT 1
+         )
+         UPDATE coupons
+         SET redeemed_at = ?1, redeemed_by_email_hash = ?2, fingerprint = ?3
+         WHERE code IN (SELECT code FROM pick)
+         RETURNING code`
+      ).bind(now, emailHash, fingerprint).first<{ code: string }>();
+
+      // Nothing to claim
+      if (!allocate?.code) {
+        // On first/second attempt, brief retry in case of transient lock/contention
+        if (attempt < MAX_TRIES) { await sleep(jitter()); continue; }
+        return { status: 410 as const, error: 'No coupons available' };
+      }
+
+      const code = allocate.code;
+
+      // Persist redemption. If uniqueness fails, revert and surface 409.
+      try {
+        await env.DB.prepare(
+          'INSERT INTO redemptions (email_hash, fingerprint, redeemed_at, coupon_code) VALUES (?1, ?2, ?3, ?4)'
+        ).bind(emailHash, fingerprint, now, code).run();
+
+        return { status: 200 as const, coupon: code };
+      } catch (e: any) {
+        // Revert the claim so stock isn’t burned
+        await env.DB
+          .prepare('UPDATE coupons SET redeemed_at = NULL, redeemed_by_email_hash = NULL, fingerprint = NULL WHERE code = ?1')
+          .bind(code)
+          .run();
+
+        const msg = String(e?.message || e);
+        // Likely uniqueness conflict -> treat as duplicate redemption
+        if (/UNIQUE|constraint/i.test(msg)) {
+          return { status: 409 as const, error: 'Already redeemed' };
+        }
+
+        // Other insert error → small retry, then bubble on last attempt
+        if (attempt < MAX_TRIES) {
+          await sleep(jitter());
+          continue;
+        }
+        throw e;
+      }
+    } catch (e) {
+      // Allocation error (e.g., transient lock) → small retry
+      if (attempt < MAX_TRIES) {
+        await sleep(jitter());
+        continue;
+      }
+      // Final failure bubbles to caller
+      throw e;
     }
-
-    // Allocate ONE available coupon and mark it redeemed in a single statement
-    const allocate = await env.DB.prepare(
-      `WITH pick AS (
-         SELECT code FROM coupons
-         WHERE redeemed_at IS NULL
-         LIMIT 1
-       )
-       UPDATE coupons
-       SET redeemed_at = ?1, redeemed_by_email_hash = ?2, fingerprint = ?3
-       WHERE code IN (SELECT code FROM pick)
-       RETURNING code`
-    ).bind(now, emailHash, fingerprint).first<{ code: string }>();
-
-    if (!allocate?.code) {
-      await env.DB.exec('ROLLBACK');
-      return { status: 410 as const, error: 'No coupons available' };
-    }
-
-    const code = allocate.code;
-
-    // Record redemption log (unique guarantees)
-    await env.DB.prepare(
-      'INSERT INTO redemptions (email_hash, fingerprint, redeemed_at, coupon_code) VALUES (?1, ?2, ?3, ?4)'
-    ).bind(emailHash, fingerprint, now, code).run();
-
-    await env.DB.exec('COMMIT');
-    return { status: 200 as const, coupon: code };
-  } catch (err) {
-    await env.DB.exec('ROLLBACK');
-    throw err;
   }
+
+  // Should not reach here
+  return { status: 500 as const, error: 'Unknown error' };
 }
 
 // ---- HTTP handler ----
@@ -118,16 +155,12 @@ async function handleRedeem(req: Request, env: Env, ctx: ExecutionContext) {
   const emailHash = await sha256Hex(email);
   const fingerprint = await makeFingerprint(req, env.FINGERPRINT_SALT);
 
-  // 3) Atomic reservation & write (tables assumed to exist)
+  // 3) Atomic reservation & write (with retries inside)
   const result = await redeemAtomic(env, emailHash, fingerprint);
   if ('error' in result) return json({ error: result.error }, result.status);
 
-  // 4) Enqueue Mailchimp payload (decoupled from request path)
-  const payload = {
-    firstName, lastName, email, consent, coupon: result.coupon,
-    redeemedAt: Date.now()
-  };
-  // Fire-and-forget enqueue; if this throws we still return 200 so the UX is snappy.
+  // 4) Enqueue Mailchimp payload (fire-and-forget)
+  const payload = { firstName, lastName, email, consent, coupon: result.coupon, redeemedAt: Date.now() };
   ctx.waitUntil(env.MC_QUEUE.send(payload));
 
   return json({ coupon: result.coupon }, 200);
