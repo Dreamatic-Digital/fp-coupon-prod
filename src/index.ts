@@ -37,29 +37,6 @@ async function makeFingerprint(req: Request, salt: string): Promise<string> {
   return sha256Hex(`${salt}|${ua}|${acc}|${lang}|${ip}`);
 }
 
-// ---- Schema helpers ----
-const SCHEMA = {
-  coupons: `CREATE TABLE IF NOT EXISTS coupons (
-    code TEXT PRIMARY KEY,
-    redeemed_at INTEGER,
-    redeemed_by_email_hash TEXT,
-    fingerprint TEXT
-  );`,
-  redemptions: `CREATE TABLE IF NOT EXISTS redemptions (
-    email_hash TEXT UNIQUE,
-    fingerprint TEXT UNIQUE,
-    redeemed_at INTEGER NOT NULL,
-    coupon_code TEXT NOT NULL,
-    UNIQUE(email_hash),
-    UNIQUE(fingerprint)
-  );`
-};
-
-async function ensureSchema(db: D1Database) {
-  // Idempotent, cheap on SQLite
-  await db.exec(`${SCHEMA.coupons}\n${SCHEMA.redemptions}`);
-}
-
 // ---- Domain allow-list check via KV ----
 async function isDomainAllowed(env: Env, email: string): Promise<boolean> {
   const domain = email.split('@')[1]?.toLowerCase().trim();
@@ -141,14 +118,11 @@ async function handleRedeem(req: Request, env: Env, ctx: ExecutionContext) {
   const emailHash = await sha256Hex(email);
   const fingerprint = await makeFingerprint(req, env.FINGERPRINT_SALT);
 
-  // 3) Ensure schema (safe if already created)
-  await ensureSchema(env.DB);
-
-  // 4) Atomic reservation & write
+  // 3) Atomic reservation & write (tables assumed to exist)
   const result = await redeemAtomic(env, emailHash, fingerprint);
   if ('error' in result) return json({ error: result.error }, result.status);
 
-  // 5) Enqueue Mailchimp payload (decoupled from request path)
+  // 4) Enqueue Mailchimp payload (decoupled from request path)
   const payload = {
     firstName, lastName, email, consent, coupon: result.coupon,
     redeemedAt: Date.now()
