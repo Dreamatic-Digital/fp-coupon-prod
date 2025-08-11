@@ -241,28 +241,3 @@ export default {
     }
   }
 };
-
-// ---- Notes ----
-// 1) Create and pre-load coupons in D1.coupons (one row per code). Keep an index on redeemed_at if you like.
-// 2) Pre-populate KV with allowed domains as keys, e.g. example.com -> "1".
-// 3) Bindings needed (wrangler.toml):
-//    [[d1_databases]]
-//    binding = "DB"
-//    database_name = "fp_coupons"
-//    database_id = "..."
-//
-//    [[kv_namespaces]]
-//    binding = "ALLOWED_DOMAINS"
-//    id = "..."
-//
-//    [[queues.producers]]
-//    binding = "MC_QUEUE"
-//    queue = "mailchimp-intake"
-//
-//    [vars]
-//    FINGERPRINT_SALT = "<random-32-bytes>"
-//    MAILCHIMP_API_KEY = "usXX-<key>"
-//    MAILCHIMP_LIST_ID = "<list>"
-//
-// 4) This design avoids race conditions by using a single UPDATE..RETURNING wrapped in a transaction. No naked SELECT LIMIT 1.
-// 5) Status codes: 400 invalid input, 403 disallowed domain, 409 already redeemed, 410 exhausted, 415 content-type error, 200 success.
