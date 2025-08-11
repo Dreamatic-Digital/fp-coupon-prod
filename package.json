@@ -1,0 +1,8 @@
+{
+  "name": "worker",
+  "private": true,
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240821.0",
+    "typescript": "^5.5.0"
+  }
+}
