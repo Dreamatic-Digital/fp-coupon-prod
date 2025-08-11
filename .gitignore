@@ -6,7 +6,8 @@ dist/
 
 # Wrangler/Cloudflare local state
 .wrangler/
-.dev.vars        # keep local env secrets out of git
+.dev.vars
+**/.dev.vars
 *.log
 
 # OS/editor noise
