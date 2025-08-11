@@ -1,11 +1,9 @@
+/// <reference types="@cloudflare/workers-types" />
 export interface Env {
   ALLOWED_DOMAINS: KVNamespace; // KV: keys are allowed email domains, value '1'
   DB: D1Database;               // D1 database binding
   MC_QUEUE: Queue;              // Cloudflare Queue binding
   FINGERPRINT_SALT: string;     // random secret for hashing fingerprints
-  // Mailchimp consumer bindings (used by the queue consumer only)
-  MAILCHIMP_API_KEY?: string;   // e.g. 'usX-xxxxxxxxxxxxxx'
-  MAILCHIMP_LIST_ID?: string;   // audience/list to add members to
 }
 
 // ---- Utilities ----
@@ -73,7 +71,7 @@ async function isDomainAllowed(env: Env, email: string): Promise<boolean> {
 // ---- Atomic coupon allocation + redemption ----
 async function redeemAtomic(env: Env, emailHash: string, fingerprint: string) {
   const now = Math.floor(Date.now() / 1000);
-  const tx = await env.DB.prepare('BEGIN IMMEDIATE').run();
+  await env.DB.prepare('BEGIN IMMEDIATE').run();
   try {
     // Block repeat redemptions by email or fingerprint
     const dup = await env.DB.prepare(
