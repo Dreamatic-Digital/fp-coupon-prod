@@ -1,5 +1,42 @@
- {
-    "name": "fp-coupon-prod",
-    "compatibility_date": "2025-08-11",
-    "main": "src/index.ts"
+{
+  "name": "fp-coupon-prod",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-08-11",
+
+  // --- D1 database ---
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fp_coupons",
+      "database_id": "84548b97-1233-4396-be56-819334cd9991"
+    }
+  ],
+
+  // --- KV namespace ---
+  "kv_namespaces": [
+    {
+      "binding": "ALLOWED_DOMAINS",
+      "id": "4f76936a183e4e56833c14634367426b"
+    }
+  ],
+
+  // --- Cloudflare Queue ---
+  "queues": {
+    "producers": [
+      {
+        "binding": "MC_QUEUE",
+        "queue": "mailchimp-intake"
+      }
+    ]
+    // "consumers": [
+    //   { "queue": "mailchimp-intake" }
+    // ]
+  },
+
+  // Vars for production (safe defaults only)
+  "vars": {
+    "FINGERPRINT_SALT": "",
+    "MAILCHIMP_API_KEY": "",
+    "MAILCHIMP_LIST_ID": ""
   }
+}
