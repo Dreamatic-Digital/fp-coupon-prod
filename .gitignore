@@ -1,0 +1,16 @@
+# Dependencies & builds
+node_modules/
+dist/
+.build/
+.tarballs/
+
+# Wrangler/Cloudflare local state
+.wrangler/
+.dev.vars        # keep local env secrets out of git
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
