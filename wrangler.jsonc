@@ -1,0 +1,5 @@
+ {
+    "name": "fp-coupon-prod",
+    "compatibility_date": "2025-08-11",
+    "main": "src/index.ts"
+  }
