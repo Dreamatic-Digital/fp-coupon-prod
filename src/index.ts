@@ -171,51 +171,6 @@ async function router(req: Request, env: Env, ctx: ExecutionContext) {
   return notFound();
 }
 
-// ---- Queue consumer (Mailchimp) ----
-// Processes details and pushes them to Mailchimp with simple back-off on rate limits. The
-// consumer lives in the same Worker for simplicity; scale by moving to a dedicated Worker if needed.
-
-async function pushToMailchimp(env: Env, item: any) {
-  const apiKey = env.MAILCHIMP_API_KEY;
-  const listId = env.MAILCHIMP_LIST_ID;
-  if (!apiKey || !listId) return; // If not configured, treat as a no-op.
-
-  const [key, dc] = apiKey.split('-');
-  if (!dc) throw new Error('MAILCHIMP_API_KEY must include data centre suffix, e.g. us21-xxxx');
-  const url = `https://${dc}.api.mailchimp.com/3.0/lists/${listId}/members`;
-
-  const member = {
-    email_address: item.email,
-    status_if_new: 'subscribed',
-    status: 'subscribed',
-    merge_fields: { FNAME: item.firstName, LNAME: item.lastName },
-    marketing_permissions: item.consent ? undefined : undefined // adjust as needed
-  };
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'authorization': 'Basic ' + btoa(`anystring:${apiKey}`),
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify(member)
-  });
-
-  if (res.status === 429 || res.status >= 500) {
-    // Signal retry by throwing; the platform will re-deliver with backoff
-    const txt = await res.text();
-    const err = new Error(`Mailchimp backoff: ${res.status} ${txt}`);
-    (err as any).retryable = true;
-    throw err;
-  }
-
-  if (!res.ok) {
-    // Non-retryable (4xx other than 429) – log and drop
-    const txt = await res.text();
-    console.warn('Mailchimp non-retryable', res.status, txt);
-  }
-}
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     try {
@@ -223,21 +178,6 @@ export default {
     } catch (err: any) {
       const msg = err?.message || 'Server error';
       return json({ error: msg }, 500);
-    }
-  },
-
-  // Cloudflare Queues consumer entrypoint
-  async queue(batch: MessageBatch<any>, env: Env, ctx: ExecutionContext) {
-    // Process sequentially to keep within vendor limits; for higher throughput, micro-batch with Promise.allSettled
-    for (const msg of batch.messages) {
-      try {
-        await pushToMailchimp(env, msg.body);
-        msg.ack();
-      } catch (err: any) {
-        console.warn('Queue processing error', err?.message || err);
-        // Let the platform retry with exponential backoff
-        msg.retry();
-      }
     }
   }
 };

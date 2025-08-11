@@ -28,9 +28,6 @@
         "queue": "mailchimp-intake"
       }
     ]
-    // "consumers": [
-    //   { "queue": "mailchimp-intake" }
-    // ]
   },
 
   // Vars for production (safe defaults only)
