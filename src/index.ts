@@ -36,12 +36,8 @@ async function makeFingerprint(req: Request, salt: string): Promise<string> {
   return sha256Hex(`${salt}|${ua}|${acc}|${lang}|${ip}`);
 }
 
-function sleep(ms: number) {
-  return new Promise(res => setTimeout(res, ms));
-}
-function jitter(min = 25, max = 75) {
-  return Math.floor(min + Math.random() * (max - min + 1));
-}
+function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+function jitter(min = 25, max = 75) { return Math.floor(min + Math.random() * (max - min + 1)); }
 
 // ---- Domain allow-list check via KV ----
 async function isDomainAllowed(env: Env, email: string): Promise<boolean> {
@@ -51,13 +47,16 @@ async function isDomainAllowed(env: Env, email: string): Promise<boolean> {
   return !!hit;
 }
 
-// ---- Atomic coupon allocation + redemption (no BEGIN; bounded retry + revert-on-conflict) ----
+// ---- Atomic coupon allocation using only `coupons` table ----
+// - No SQL BEGIN/COMMIT
+// - Bounded retry (3x) with tiny jitter
+// - Enforced one-per-email/fingerprint via partial UNIQUE indexes on coupons
 async function redeemAtomic(env: Env, emailHash: string, fingerprint: string) {
   const now = Math.floor(Date.now() / 1000);
 
-  // Quick duplicate check (cheap)
+  // Fast duplicate check (cheap path)
   const dup = await env.DB
-    .prepare('SELECT 1 FROM redemptions WHERE email_hash = ?1 OR fingerprint = ?2 LIMIT 1')
+    .prepare('SELECT 1 FROM coupons WHERE redeemed_by_email_hash = ?1 OR fingerprint = ?2 LIMIT 1')
     .bind(emailHash, fingerprint)
     .first();
   if (dup) return { status: 409 as const, error: 'Already redeemed' };
@@ -65,7 +64,7 @@ async function redeemAtomic(env: Env, emailHash: string, fingerprint: string) {
   const MAX_TRIES = 3;
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     try {
-      // Claim one coupon atomically
+      // Claim ONE available coupon atomically and stamp ownership
       const allocate = await env.DB.prepare(
         `WITH pick AS (
            SELECT code FROM coupons
@@ -78,49 +77,32 @@ async function redeemAtomic(env: Env, emailHash: string, fingerprint: string) {
          RETURNING code`
       ).bind(now, emailHash, fingerprint).first<{ code: string }>();
 
-      // Nothing to claim
       if (!allocate?.code) {
-        // On first/second attempt, brief retry in case of transient lock/contention
+        // brief retry in case of momentary contention; otherwise out of stock
         if (attempt < MAX_TRIES) { await sleep(jitter()); continue; }
         return { status: 410 as const, error: 'No coupons available' };
       }
 
-      const code = allocate.code;
+      // If partial UNIQUE indexes exist, a competing request trying to use the same
+      // email/fingerprint would make this UPDATE fail with a UNIQUE constraint error,
+      // which we'd catch in the catch-block and translate to 409. Since we got here,
+      // the claim succeeded.
+      return { status: 200 as const, coupon: allocate.code };
+    } catch (e: any) {
+      const msg = String(e?.message || e);
 
-      // Persist redemption. If uniqueness fails, revert and surface 409.
-      try {
-        await env.DB.prepare(
-          'INSERT INTO redemptions (email_hash, fingerprint, redeemed_at, coupon_code) VALUES (?1, ?2, ?3, ?4)'
-        ).bind(emailHash, fingerprint, now, code).run();
-
-        return { status: 200 as const, coupon: code };
-      } catch (e: any) {
-        // Revert the claim so stock isn’t burned
-        await env.DB
-          .prepare('UPDATE coupons SET redeemed_at = NULL, redeemed_by_email_hash = NULL, fingerprint = NULL WHERE code = ?1')
-          .bind(code)
-          .run();
-
-        const msg = String(e?.message || e);
-        // Likely uniqueness conflict -> treat as duplicate redemption
-        if (/UNIQUE|constraint/i.test(msg)) {
-          return { status: 409 as const, error: 'Already redeemed' };
-        }
-
-        // Other insert error → small retry, then bubble on last attempt
-        if (attempt < MAX_TRIES) {
-          await sleep(jitter());
-          continue;
-        }
-        throw e;
+      // If UNIQUE constraint tripped (because another row already has this email/fp), surface 409
+      if (/UNIQUE|constraint/i.test(msg)) {
+        return { status: 409 as const, error: 'Already redeemed' };
       }
-    } catch (e) {
-      // Allocation error (e.g., transient lock) → small retry
+
+      // Transient error → quick retry
       if (attempt < MAX_TRIES) {
         await sleep(jitter());
         continue;
       }
-      // Final failure bubbles to caller
+
+      // Final failure bubbles
       throw e;
     }
   }
@@ -155,7 +137,18 @@ async function handleRedeem(req: Request, env: Env, ctx: ExecutionContext) {
   const emailHash = await sha256Hex(email);
   const fingerprint = await makeFingerprint(req, env.FINGERPRINT_SALT);
 
-  // 3) Atomic reservation & write (with retries inside)
+  // 2.5) (Optional but recommended) Ensure partial UNIQUE indexes once — cheap/idempotent
+  //      These prevent multiple coupons being assigned to the same email/fingerprint.
+  try {
+    await env.DB.prepare(
+      "CREATE UNIQUE INDEX IF NOT EXISTS ux_coupons_email_once ON coupons(redeemed_by_email_hash) WHERE redeemed_by_email_hash IS NOT NULL"
+    ).run();
+    await env.DB.prepare(
+      "CREATE UNIQUE INDEX IF NOT EXISTS ux_coupons_fp_once ON coupons(fingerprint) WHERE fingerprint IS NOT NULL"
+    ).run();
+  } catch { /* ignore if not supported or already created */ }
+
+  // 3) Atomic reservation & write (with internal retries)
   const result = await redeemAtomic(env, emailHash, fingerprint);
   if ('error' in result) return json({ error: result.error }, result.status);
 
